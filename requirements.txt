@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-dotenv
+httpx
+requests
+openai
+
+langchain-core
+langchain-openai
+langchain-classic
+langchain-chroma
+chromadb
+
+pydantic
+pandas
+openpyxl
