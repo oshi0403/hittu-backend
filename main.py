@@ -42,14 +42,22 @@ app.add_middleware(
 # ============================================================
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "cwd": os.getcwd(),
+        "file": __file__,
+    }
 
 # ============================================================
 # ルート
 # ============================================================
 @app.get("/")
 def root():
-    return {"status": "hittu backend running"}
+    return {
+        "status": "hittu backend running",
+        "cwd": os.getcwd(),
+        "file": __file__,
+    }
 
 # ============================================================
 # 起動時処理（軽いチェックのみ）
