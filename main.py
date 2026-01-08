@@ -1,31 +1,69 @@
 import os
-import re
-import time
-from typing import List, Any
+from typing import List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from httpx_config import get_http_client
-from predict import generate_predicted_questions
-
 from pydantic import BaseModel
 
 from langchain_openai import ChatOpenAI
 from langchain_classic.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
+
+from httpx_config import get_http_client
+from predict import generate_predicted_questions
 from vector_store import ChromaVectorStore
 
 # ============================================================
 # 環境変数
 # ============================================================
 load_dotenv()
+
 CHROMA_PATH = os.getenv("CHROMA_PERSIST_DIR", "chroma_db")
-
-
 DEBUG_PRINT_PROMPT = False
+
+# ============================================================
+# FastAPI
+# ============================================================
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================
+# ヘルスチェック（Startup / Readiness Probe 用）
+# ============================================================
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ============================================================
+# ルート
+# ============================================================
+@app.get("/")
+def root():
+    return {"status": "hittu backend running"}
+
+# ============================================================
+# 起動時処理（軽いチェックのみ）
+# ============================================================
+@app.on_event("startup")
+async def startup_event():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY が未設定です")
+
+    # OpenAI クライアント初期化（通信はしない）
+    OpenAI(api_key=api_key, http_client=get_http_client())
+
+    print("FastAPI 起動完了")
 
 # ============================================================
 # 会話履歴（サーバメモリ）
@@ -44,25 +82,32 @@ def build_chat_history_text() -> str:
     return "\n".join(lines)
 
 # ============================================================
-# Chroma（PersistentClient 統一）
+# 遅延初期化（★重要）
 # ============================================================
-vector_store = ChromaVectorStore(
-    collection_name="hittu-knowledge",
-    k=4
-)
-retriever = vector_store.get_retriever()
+qa_chain = None
 
-# ============================================================
-# LLM
-# ============================================================
-llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+def get_qa_chain() -> RetrievalQA:
+    global qa_chain
+    if qa_chain is not None:
+        return qa_chain
 
-# ============================================================
-# プロンプト
-# ============================================================
-prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""
+    # --- Chroma ---
+    vector_store = ChromaVectorStore(
+        collection_name="hittu-knowledge",
+        k=4
+    )
+    retriever = vector_store.get_retriever()
+
+    # --- LLM ---
+    llm = ChatOpenAI(
+        model="gpt-4.1-mini",
+        temperature=0
+    )
+
+    # --- Prompt ---
+    prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template="""
 あなたは「ひっつー」という同志社大学の大学情報を教えてくれる羊のキャラクターです。
 質問に対して、やさしく親しみやすい口調で、丁寧に答えてください。
 難しい言葉は使わず、わかりやすい説明をしてください。
@@ -77,39 +122,16 @@ prompt = PromptTemplate(
 
 【回答】
 """
-)
+    )
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    chain_type="stuff",
-    chain_type_kwargs={"prompt": prompt},
-)
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        chain_type="stuff",
+        chain_type_kwargs={"prompt": prompt},
+    )
 
-# ============================================================
-# FastAPI
-# ============================================================
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
-
-@app.on_event("startup")
-async def startup_event():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY が未設定です")
-    OpenAI(api_key=api_key, http_client=get_http_client())
-    print("FastAPI 起動完了")
+    return qa_chain
 
 # ============================================================
 # 質問予測
@@ -136,6 +158,11 @@ class ChatResponse(BaseModel):
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_with_bot(request: ChatRequest):
+    try:
+        chain = get_qa_chain()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"初期化エラー: {str(e)}")
+
     user_message = request.message
 
     chat_history_text = build_chat_history_text()
@@ -144,13 +171,9 @@ async def chat_with_bot(request: ChatRequest):
         if chat_history_text else user_message
     )
 
-    result = qa_chain.invoke({"query": question})
+    result = chain.invoke({"query": question})
     bot_response = result["result"]
 
     CHAT_HISTORY.append({"user": user_message, "bot": bot_response})
 
     return ChatResponse(response=bot_response)
-
-@app.get("/")
-async def root():
-    return {"status": "hittu backend running"}
